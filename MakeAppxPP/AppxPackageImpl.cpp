@@ -9,9 +9,20 @@
 #include <bcrypt.h>
 #include <ntstatus.h>
 #include <random>
-#include <iostream>
+#include <codecvt>
+#include <locale>
 
 #pragma comment(lib, "bcrypt.lib")
+
+#ifndef ZIP_CM_DEFAULT
+#define ZIP_CM_DEFAULT -1
+#endif
+#ifndef ZIP_CM_STORE  
+#define ZIP_CM_STORE 0
+#endif
+#ifndef ZIP_CM_DEFLATE
+#define ZIP_CM_DEFLATE 8
+#endif
 
 namespace fs = std::filesystem;
 
@@ -29,29 +40,29 @@ namespace MakeAppxCore {
         return std::make_unique<AppxBuilderImpl>();
     }
 
-    std::wstring WideStringToString(const std::wstring& wstr) {
-        if (wstr.empty()) return std::wstring();
+    std::string WideToUtf8Safe(const std::wstring& wstr) {
+        if (wstr.empty()) return std::string();
 
-        int size = WideCharToMultiByte(CP_UTF8, 0, &wstr[0], static_cast<int>(wstr.size()),
-            nullptr, 0, nullptr, nullptr);
-        if (size == 0) return std::wstring();
+        int size = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, nullptr, 0, nullptr, nullptr);
+        if (size <= 0) {
+            return std::string(wstr.begin(), wstr.end());
+        }
 
-        std::string result(size, 0);
-        WideCharToMultiByte(CP_UTF8, 0, &wstr[0], static_cast<int>(wstr.size()),
-            &result[0], size, nullptr, nullptr);
-        return std::wstring(result.begin(), result.end());
+        std::string result(size - 1, 0);
+        WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, &result[0], size, nullptr, nullptr);
+        return result;
     }
 
-    std::wstring StringToWideString(const std::string& str) {
+    std::wstring Utf8ToWideSafe(const std::string& str) {
         if (str.empty()) return std::wstring();
 
-        int size = MultiByteToWideChar(CP_UTF8, 0, &str[0], static_cast<int>(str.size()),
-            nullptr, 0);
-        if (size == 0) return std::wstring();
+        int size = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, nullptr, 0);
+        if (size <= 0) {
+            return std::wstring(str.begin(), str.end());
+        }
 
-        std::wstring result(size, 0);
-        MultiByteToWideChar(CP_UTF8, 0, &str[0], static_cast<int>(str.size()),
-            &result[0], size);
+        std::wstring result(size - 1, 0);
+        MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, &result[0], size);
         return result;
     }
 
@@ -60,11 +71,11 @@ namespace MakeAppxCore {
     }
 
     std::wstring AppxPackageImpl::WideToUtf8(const std::wstring& wide) {
-        return WideStringToString(wide);
+        return Utf8ToWideSafe(WideToUtf8Safe(wide));
     }
 
     std::wstring AppxPackageImpl::Utf8ToWide(const std::string& utf8) {
-        return StringToWideString(utf8);
+        return Utf8ToWideSafe(utf8);
     }
 
     bool AppxPackageImpl::PromptUserOverwrite(const std::wstring& filePath) {
@@ -111,6 +122,546 @@ namespace MakeAppxCore {
         }
 
         return true;
+    }
+
+    bool AppxPackageImpl::ProcessFileTree(const std::wstring& rootPath,
+        std::vector<PackageFile>& files) {
+        try {
+            for (const auto& entry : fs::recursive_directory_iterator(rootPath)) {
+                if (entry.is_regular_file()) {
+                    PackageFile pf;
+                    pf.localPath = entry.path().wstring();
+                    pf.packagePath = fs::relative(entry.path(), rootPath).wstring();
+                    pf.size = entry.file_size();
+                    pf.attributes = static_cast<uint32_t>(entry.status().permissions());
+                    files.push_back(pf);
+                }
+            }
+            return true;
+        }
+        catch (const std::exception& e) {
+            std::wstring error = L"Error processing file tree: ";
+            error += Utf8ToWideSafe(e.what());
+            SetError(error);
+            return false;
+        }
+    }
+
+    bool AppxPackageImpl::Pack(const std::wstring& inputPath, const std::wstring& outputPath,
+        CompressionLevel compression, ProgressCallback callback) {
+
+        std::wcout << L"[DEBUG] Pack method called" << std::endl;
+        std::wcout << L"[DEBUG] Input: " << inputPath << std::endl;
+        std::wcout << L"[DEBUG] Output: " << outputPath << std::endl;
+
+        if (!fs::exists(inputPath) || !fs::is_directory(inputPath)) {
+            SetError(L"Input path does not exist or is not a directory");
+            std::wcerr << L"[ERROR] " << GetLastError() << std::endl;
+            return false;
+        }
+
+        std::wstring manifestPath = inputPath + L"\\AppxManifest.xml";
+        std::wcout << L"[DEBUG] Checking manifest: " << manifestPath << std::endl;
+
+        if (!ValidateManifest(manifestPath)) {
+            std::wcerr << L"[ERROR] Manifest validation failed: " << GetLastError() << std::endl;
+            return false;
+        }
+
+        std::wcout << L"[DEBUG] Creating output directory if needed" << std::endl;
+        fs::path outputDir = fs::path(outputPath).parent_path();
+        if (!outputDir.empty() && !fs::exists(outputDir)) {
+            try {
+                fs::create_directories(outputDir);
+            }
+            catch (const std::exception& e) {
+                SetError(L"Failed to create output directory: " + Utf8ToWideSafe(e.what()));
+                return false;
+            }
+        }
+
+        std::wcout << L"[DEBUG] Processing file tree" << std::endl;
+        std::vector<PackageFile> files;
+        if (!ProcessFileTree(inputPath, files)) {
+            std::wcerr << L"[ERROR] Failed to process file tree: " << GetLastError() << std::endl;
+            return false;
+        }
+
+        std::wcout << L"[DEBUG] Found " << files.size() << L" files to pack" << std::endl;
+
+        if (files.empty()) {
+            SetError(L"No files found to package");
+            return false;
+        }
+
+        std::string outputPathUtf8 = WideToUtf8Safe(outputPath);
+        if (outputPathUtf8.empty()) {
+            SetError(L"Failed to convert output path to UTF-8");
+            return false;
+        }
+
+        std::wcout << L"[DEBUG] Opening ZIP file for writing: " << outputPath << std::endl;
+
+        int error = 0;
+        zip_t* zip = zip_open(outputPathUtf8.c_str(), ZIP_CREATE | ZIP_TRUNCATE, &error);
+
+        if (!zip) {
+            std::wstringstream ss;
+            ss << L"Failed to create output package. ZIP error code: " << error;
+            SetError(ss.str());
+            std::wcerr << L"[ERROR] " << GetLastError() << std::endl;
+            return false;
+        }
+
+        struct ZipGuard {
+            zip_t* zip;
+            ZipGuard(zip_t* z) : zip(z) {}
+            ~ZipGuard() {
+                if (zip) {
+                    int result = zip_close(zip);
+                    if (result != 0) {
+                        std::wcerr << L"[WARNING] Failed to close ZIP file properly" << std::endl;
+                    }
+                }
+            }
+        } zipGuard(zip);
+
+        std::wcout << L"[DEBUG] ZIP file opened successfully" << std::endl;
+
+        int compressionMethod = ZIP_CM_DEFAULT;
+        switch (compression) {
+        case CompressionLevel::None:
+            compressionMethod = ZIP_CM_STORE;
+            break;
+        case CompressionLevel::Fast:
+        case CompressionLevel::Normal:
+        case CompressionLevel::Maximum:
+            compressionMethod = ZIP_CM_DEFLATE;
+            break;
+        }
+
+        ProgressInfo progress = {};
+        progress.totalFiles = files.size();
+        progress.totalBytes = 0;
+
+        for (const auto& file : files) {
+            progress.totalBytes += file.size;
+        }
+
+        uint64_t processedBytes = 0;
+        for (size_t i = 0; i < files.size(); ++i) {
+            const auto& file = files[i];
+
+            if (callback) {
+                progress.processedFiles = i;
+                progress.processedBytes = processedBytes;
+                progress.currentFile = file.packagePath;
+                callback(progress);
+            }
+
+            std::string packagePathUtf8 = WideToUtf8Safe(file.packagePath);
+            std::string localPathUtf8 = WideToUtf8Safe(file.localPath);
+
+            if (packagePathUtf8.empty() || localPathUtf8.empty()) {
+                SetError(L"Failed to convert file paths to UTF-8: " + file.packagePath);
+                return false;
+            }
+
+            std::wcout << L"[DEBUG] Adding file: " << file.packagePath << std::endl;
+
+            zip_source_t* source = zip_source_file(zip, localPathUtf8.c_str(), 0, -1);
+            if (!source) {
+                zip_error_t* zip_err = zip_get_error(zip);
+                std::wstring error_msg = L"Failed to create source for file: " + file.packagePath;
+                if (zip_err) {
+                    error_msg += L" (ZIP error: " + Utf8ToWideSafe(zip_error_strerror(zip_err)) + L")";
+                }
+                SetError(error_msg);
+                return false;
+            }
+
+            zip_int64_t index = zip_file_add(zip, packagePathUtf8.c_str(), source, ZIP_FL_OVERWRITE);
+            if (index < 0) {
+                zip_error_t* zip_err = zip_get_error(zip);
+                std::wstring error_msg = L"Failed to add file to package: " + file.packagePath;
+                if (zip_err) {
+                    error_msg += L" (ZIP error: " + Utf8ToWideSafe(zip_error_strerror(zip_err)) + L")";
+                }
+                SetError(error_msg);
+                return false;
+            }
+
+            if (compressionMethod != ZIP_CM_DEFAULT) {
+                if (zip_set_file_compression(zip, index, compressionMethod, 0) != 0) {
+                    std::wcout << L"[WARNING] Failed to set compression for: " << file.packagePath << std::endl;
+                }
+            }
+
+            processedBytes += file.size;
+        }
+
+        if (callback) {
+            progress.processedFiles = files.size();
+            progress.processedBytes = processedBytes;
+            progress.currentFile = L"Finalizing...";
+            callback(progress);
+        }
+
+        std::wcout << L"[DEBUG] All files added, finalizing ZIP" << std::endl;
+
+        std::wcout << L"[DEBUG] Package created successfully" << std::endl;
+        return true;
+    }
+
+    bool AppxPackageImpl::Unpack(const std::wstring& inputPath, const std::wstring& outputPath,
+        OverwriteMode overwrite, ProgressCallback callback) {
+
+        std::string inputPathUtf8 = WideToUtf8Safe(inputPath);
+        if (inputPathUtf8.empty()) {
+            SetError(L"Failed to convert input path to UTF-8");
+            return false;
+        }
+
+        zip_t* zip = zip_open(inputPathUtf8.c_str(), ZIP_RDONLY, nullptr);
+        if (!zip) {
+            SetError(L"Failed to open package file");
+            return false;
+        }
+
+        struct ZipGuard {
+            zip_t* zip;
+            ZipGuard(zip_t* z) : zip(z) {}
+            ~ZipGuard() {
+                if (zip) zip_close(zip);
+            }
+        } zipGuard(zip);
+
+        if (!fs::exists(outputPath)) {
+            try {
+                fs::create_directories(outputPath);
+            }
+            catch (const std::exception& e) {
+                SetError(L"Failed to create output directory: " + Utf8ToWideSafe(e.what()));
+                return false;
+            }
+        }
+
+        zip_int64_t numEntries = zip_get_num_entries(zip, 0);
+        if (numEntries < 0) {
+            SetError(L"Failed to get package contents");
+            return false;
+        }
+
+        ProgressInfo progress = {};
+        progress.totalFiles = static_cast<uint64_t>(numEntries);
+        progress.totalBytes = 0;
+
+        for (zip_int64_t i = 0; i < numEntries; ++i) {
+            const char* name = zip_get_name(zip, i, 0);
+            if (!name) continue;
+
+            std::wstring fileName = Utf8ToWideSafe(name);
+            std::wstring fullPath = outputPath + L"\\" + fileName;
+
+            if (callback) {
+                progress.processedFiles = static_cast<uint64_t>(i);
+                progress.currentFile = fileName;
+                callback(progress);
+            }
+
+            if (fs::exists(fullPath)) {
+                if (overwrite == OverwriteMode::No) continue;
+                if (overwrite == OverwriteMode::Ask) {
+                    if (!PromptUserOverwrite(fileName)) {
+                        continue;
+                    }
+                }
+            }
+
+            fs::path filePath(fullPath);
+            if (filePath.has_parent_path()) {
+                try {
+                    fs::create_directories(filePath.parent_path());
+                }
+                catch (...) {
+                    continue;
+                }
+            }
+
+            zip_file_t* zipFile = zip_fopen_index(zip, i, 0);
+            if (!zipFile) continue;
+
+            std::ofstream outFile(fullPath, std::ios::binary);
+            if (!outFile.is_open()) {
+                zip_fclose(zipFile);
+                continue;
+            }
+
+            char buffer[BUFFER_SIZE];
+            zip_int64_t bytesRead;
+            while ((bytesRead = zip_fread(zipFile, buffer, BUFFER_SIZE)) > 0) {
+                outFile.write(buffer, bytesRead);
+                progress.processedBytes += static_cast<uint64_t>(bytesRead);
+            }
+
+            outFile.close();
+            zip_fclose(zipFile);
+        }
+
+        if (callback) {
+            progress.processedFiles = static_cast<uint64_t>(numEntries);
+            progress.currentFile = L"Complete";
+            callback(progress);
+        }
+
+        return true;
+    }
+
+    bool AppxPackageImpl::Encrypt(const std::wstring& inputPath, const std::wstring& outputPath,
+        const std::wstring& keyFile) {
+
+        if (!fs::exists(inputPath)) {
+            SetError(L"Input package file does not exist");
+            return false;
+        }
+
+        if (!fs::exists(keyFile)) {
+            SetError(L"Key file does not exist");
+            return false;
+        }
+
+        try {
+            std::ifstream keyFileStream(keyFile, std::ios::binary);
+            if (!keyFileStream.is_open()) {
+                SetError(L"Cannot open key file");
+                return false;
+            }
+
+            std::vector<uint8_t> keyData((std::istreambuf_iterator<char>(keyFileStream)),
+                std::istreambuf_iterator<char>());
+            keyFileStream.close();
+
+            if (keyData.size() != 32) {
+                SetError(L"Invalid key file - must be exactly 32 bytes for AES-256");
+                return false;
+            }
+
+            BCRYPT_ALG_HANDLE hAlgorithm = nullptr;
+            BCRYPT_KEY_HANDLE hKey = nullptr;
+            NTSTATUS status;
+
+            status = BCryptOpenAlgorithmProvider(&hAlgorithm, BCRYPT_AES_ALGORITHM, nullptr, 0);
+            if (!BCRYPT_SUCCESS(status)) {
+                SetError(L"Failed to open AES algorithm provider");
+                return false;
+            }
+
+            status = BCryptSetProperty(hAlgorithm, BCRYPT_CHAINING_MODE,
+                (PUCHAR)BCRYPT_CHAIN_MODE_CBC,
+                sizeof(BCRYPT_CHAIN_MODE_CBC), 0);
+            if (!BCRYPT_SUCCESS(status)) {
+                BCryptCloseAlgorithmProvider(hAlgorithm, 0);
+                SetError(L"Failed to set chaining mode");
+                return false;
+            }
+
+            status = BCryptGenerateSymmetricKey(hAlgorithm, &hKey, nullptr, 0,
+                keyData.data(), 32, 0);
+            if (!BCRYPT_SUCCESS(status)) {
+                BCryptCloseAlgorithmProvider(hAlgorithm, 0);
+                SetError(L"Failed to generate symmetric key");
+                return false;
+            }
+
+            uint8_t iv[16];
+            std::random_device rd;
+            std::mt19937 gen(rd());
+            std::uniform_int_distribution<int> dis(0, 255);
+            for (int i = 0; i < 16; ++i) {
+                iv[i] = static_cast<uint8_t>(dis(gen));
+            }
+
+            std::ifstream inputFile(inputPath, std::ios::binary);
+            std::ofstream outputFile(outputPath, std::ios::binary);
+
+            if (!inputFile.is_open() || !outputFile.is_open()) {
+                BCryptDestroyKey(hKey);
+                BCryptCloseAlgorithmProvider(hAlgorithm, 0);
+                SetError(L"Failed to open input or output file");
+                return false;
+            }
+
+            outputFile.write(reinterpret_cast<char*>(iv), 16);
+
+            const size_t CHUNK_SIZE = 8192;
+            uint8_t inputBuffer[CHUNK_SIZE];
+            uint8_t outputBuffer[CHUNK_SIZE + 16];
+            ULONG bytesEncrypted;
+
+            while (inputFile.read(reinterpret_cast<char*>(inputBuffer), CHUNK_SIZE)) {
+                std::streamsize bytesRead = inputFile.gcount();
+
+                if (bytesRead < CHUNK_SIZE) {
+                    size_t padSize = 16 - (bytesRead % 16);
+                    if (padSize == 16 && bytesRead % 16 == 0) padSize = 0;
+                    for (size_t i = 0; i < padSize; ++i) {
+                        inputBuffer[bytesRead + i] = static_cast<uint8_t>(padSize);
+                    }
+                    bytesRead += padSize;
+                }
+
+                status = BCryptEncrypt(hKey, inputBuffer, static_cast<ULONG>(bytesRead),
+                    nullptr, iv, 16, outputBuffer, sizeof(outputBuffer),
+                    &bytesEncrypted, 0);
+
+                if (!BCRYPT_SUCCESS(status)) {
+                    BCryptDestroyKey(hKey);
+                    BCryptCloseAlgorithmProvider(hAlgorithm, 0);
+                    SetError(L"Encryption failed");
+                    return false;
+                }
+
+                outputFile.write(reinterpret_cast<char*>(outputBuffer), bytesEncrypted);
+                memcpy(iv, outputBuffer + bytesEncrypted - 16, 16);
+            }
+
+            inputFile.close();
+            outputFile.close();
+            BCryptDestroyKey(hKey);
+            BCryptCloseAlgorithmProvider(hAlgorithm, 0);
+
+            return true;
+        }
+        catch (const std::exception& e) {
+            SetError(L"Encryption failed: " + Utf8ToWideSafe(e.what()));
+            return false;
+        }
+    }
+
+    bool AppxPackageImpl::Decrypt(const std::wstring& inputPath, const std::wstring& outputPath,
+        const std::wstring& keyFile) {
+
+        if (!fs::exists(inputPath)) {
+            SetError(L"Input encrypted file does not exist");
+            return false;
+        }
+
+        if (!fs::exists(keyFile)) {
+            SetError(L"Key file does not exist");
+            return false;
+        }
+
+        try {
+            std::ifstream keyFileStream(keyFile, std::ios::binary);
+            if (!keyFileStream.is_open()) {
+                SetError(L"Cannot open key file");
+                return false;
+            }
+
+            std::vector<uint8_t> keyData((std::istreambuf_iterator<char>(keyFileStream)),
+                std::istreambuf_iterator<char>());
+            keyFileStream.close();
+
+            if (keyData.size() != 32) {
+                SetError(L"Invalid key file - must be exactly 32 bytes for AES-256");
+                return false;
+            }
+
+            BCRYPT_ALG_HANDLE hAlgorithm = nullptr;
+            BCRYPT_KEY_HANDLE hKey = nullptr;
+            NTSTATUS status;
+
+            status = BCryptOpenAlgorithmProvider(&hAlgorithm, BCRYPT_AES_ALGORITHM, nullptr, 0);
+            if (!BCRYPT_SUCCESS(status)) {
+                SetError(L"Failed to open AES algorithm provider");
+                return false;
+            }
+
+            status = BCryptSetProperty(hAlgorithm, BCRYPT_CHAINING_MODE,
+                (PUCHAR)BCRYPT_CHAIN_MODE_CBC,
+                sizeof(BCRYPT_CHAIN_MODE_CBC), 0);
+            if (!BCRYPT_SUCCESS(status)) {
+                BCryptCloseAlgorithmProvider(hAlgorithm, 0);
+                SetError(L"Failed to set chaining mode");
+                return false;
+            }
+
+            status = BCryptGenerateSymmetricKey(hAlgorithm, &hKey, nullptr, 0,
+                keyData.data(), 32, 0);
+            if (!BCRYPT_SUCCESS(status)) {
+                BCryptCloseAlgorithmProvider(hAlgorithm, 0);
+                SetError(L"Failed to generate symmetric key");
+                return false;
+            }
+
+            std::ifstream inputFile(inputPath, std::ios::binary);
+            std::ofstream outputFile(outputPath, std::ios::binary);
+
+            if (!inputFile.is_open() || !outputFile.is_open()) {
+                BCryptDestroyKey(hKey);
+                BCryptCloseAlgorithmProvider(hAlgorithm, 0);
+                SetError(L"Failed to open input or output file");
+                return false;
+            }
+
+            uint8_t iv[16];
+            inputFile.read(reinterpret_cast<char*>(iv), 16);
+            if (inputFile.gcount() != 16) {
+                BCryptDestroyKey(hKey);
+                BCryptCloseAlgorithmProvider(hAlgorithm, 0);
+                SetError(L"Invalid encrypted file - missing IV");
+                return false;
+            }
+
+            const size_t CHUNK_SIZE = 8192;
+            uint8_t inputBuffer[CHUNK_SIZE];
+            uint8_t outputBuffer[CHUNK_SIZE];
+            ULONG bytesDecrypted;
+            bool isLastChunk = false;
+
+            while (inputFile.read(reinterpret_cast<char*>(inputBuffer), CHUNK_SIZE)) {
+                std::streamsize bytesRead = inputFile.gcount();
+
+                if (bytesRead < CHUNK_SIZE) {
+                    isLastChunk = true;
+                }
+
+                status = BCryptDecrypt(hKey, inputBuffer, static_cast<ULONG>(bytesRead),
+                    nullptr, iv, 16, outputBuffer, sizeof(outputBuffer),
+                    &bytesDecrypted, 0);
+
+                if (!BCRYPT_SUCCESS(status)) {
+                    BCryptDestroyKey(hKey);
+                    BCryptCloseAlgorithmProvider(hAlgorithm, 0);
+                    SetError(L"Decryption failed");
+                    return false;
+                }
+
+                if (isLastChunk && bytesDecrypted > 0) {
+                    uint8_t padSize = outputBuffer[bytesDecrypted - 1];
+                    if (padSize <= 16 && padSize <= bytesDecrypted) {
+                        bytesDecrypted -= padSize;
+                    }
+                }
+
+                if (bytesDecrypted > 0) {
+                    outputFile.write(reinterpret_cast<char*>(outputBuffer), bytesDecrypted);
+                }
+
+                memcpy(iv, inputBuffer + bytesRead - 16, 16);
+            }
+
+            inputFile.close();
+            outputFile.close();
+            BCryptDestroyKey(hKey);
+            BCryptCloseAlgorithmProvider(hAlgorithm, 0);
+
+            return true;
+        }
+        catch (const std::exception& e) {
+            SetError(L"Decryption failed: " + Utf8ToWideSafe(e.what()));
+            return false;
+        }
     }
 
     std::wstring AppxBundleImpl::GenerateBundleManifest(const std::vector<fs::path>& packageFiles) {
@@ -170,12 +721,233 @@ namespace MakeAppxCore {
         }
     }
 
-    void AppxBuilderImpl::SetError(const std::wstring& error) {
+    void AppxBundleImpl::SetError(const std::wstring& error) {
         m_lastError = error;
     }
 
-    std::wstring Utf8ToWideString(const std::string& utf8) {
-        return StringToWideString(utf8);
+    bool AppxBundleImpl::Bundle(const std::wstring& inputPath, const std::wstring& outputPath,
+        CompressionLevel compression, ProgressCallback callback) {
+
+        if (!fs::exists(inputPath) || !fs::is_directory(inputPath)) {
+            SetError(L"Input path does not exist or is not a directory");
+            return false;
+        }
+
+        std::vector<fs::path> packageFiles;
+        try {
+            for (const auto& entry : fs::directory_iterator(inputPath)) {
+                if (entry.is_regular_file()) {
+                    auto ext = entry.path().extension().wstring();
+                    std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
+                    if (ext == L".appx" || ext == L".msix") {
+                        packageFiles.push_back(entry.path());
+                    }
+                }
+            }
+        }
+        catch (const std::exception& e) {
+            SetError(L"Error scanning input directory");
+            return false;
+        }
+
+        if (packageFiles.empty()) {
+            SetError(L"No .appx or .msix files found in input directory");
+            return false;
+        }
+
+        std::wstring bundleManifest = GenerateBundleManifest(packageFiles);
+        if (bundleManifest.empty()) {
+            return false;
+        }
+
+        fs::path outputDir = fs::path(outputPath).parent_path();
+        if (!outputDir.empty() && !fs::exists(outputDir)) {
+            try {
+                fs::create_directories(outputDir);
+            }
+            catch (const std::exception& e) {
+                SetError(L"Failed to create output directory: " + Utf8ToWideSafe(e.what()));
+                return false;
+            }
+        }
+
+        int compressionMethod = (compression == CompressionLevel::None) ? ZIP_CM_STORE : ZIP_CM_DEFLATE;
+        std::string outputPathUtf8 = WideToUtf8Safe(outputPath);
+
+        zip_t* zip = zip_open(outputPathUtf8.c_str(), ZIP_CREATE | ZIP_TRUNCATE, nullptr);
+        if (!zip) {
+            SetError(L"Failed to create bundle file");
+            return false;
+        }
+
+        struct ZipGuard {
+            zip_t* zip;
+            ZipGuard(zip_t* z) : zip(z) {}
+            ~ZipGuard() {
+                if (zip) zip_close(zip);
+            }
+        } zipGuard(zip);
+
+        ProgressInfo progress = {};
+        progress.totalFiles = packageFiles.size() + 1;
+        progress.totalBytes = 0;
+
+        for (const auto& file : packageFiles) {
+            try {
+                progress.totalBytes += fs::file_size(file);
+            }
+            catch (...) {
+                continue;
+            }
+        }
+
+        std::string manifestUtf8 = WideToUtf8Safe(bundleManifest);
+        zip_source_t* manifestSource = zip_source_buffer(zip,
+            manifestUtf8.c_str(), manifestUtf8.length(), 0);
+        if (!manifestSource || zip_file_add(zip, "AppxBundleManifest.xml", manifestSource, ZIP_FL_OVERWRITE) < 0) {
+            SetError(L"Failed to add bundle manifest");
+            return false;
+        }
+
+        uint64_t processedBytes = 0;
+        for (size_t i = 0; i < packageFiles.size(); ++i) {
+            const auto& packageFile = packageFiles[i];
+
+            if (callback) {
+                progress.processedFiles = i + 1;
+                progress.processedBytes = processedBytes;
+                progress.currentFile = packageFile.filename().wstring();
+                callback(progress);
+            }
+
+            std::string localPathUtf8 = WideToUtf8Safe(packageFile.wstring());
+            std::string packageName = WideToUtf8Safe(packageFile.filename().wstring());
+
+            zip_source_t* source = zip_source_file(zip, localPathUtf8.c_str(), 0, -1);
+            if (!source) {
+                SetError(L"Failed to create source for: " + packageFile.wstring());
+                return false;
+            }
+
+            zip_int64_t index = zip_file_add(zip, packageName.c_str(), source, ZIP_FL_OVERWRITE);
+            if (index < 0) {
+                zip_source_free(source);
+                SetError(L"Failed to add package to bundle: " + packageFile.wstring());
+                return false;
+            }
+
+            zip_set_file_compression(zip, index, compressionMethod, 0);
+
+            try {
+                processedBytes += fs::file_size(packageFile);
+            }
+            catch (...) {
+            }
+        }
+
+        if (callback) {
+            progress.processedFiles = packageFiles.size() + 1;
+            progress.processedBytes = processedBytes;
+            progress.currentFile = L"Finalizing bundle...";
+            callback(progress);
+        }
+
+        return true;
+    }
+
+    bool AppxBundleImpl::Unbundle(const std::wstring& inputPath, const std::wstring& outputPath,
+        OverwriteMode overwrite, ProgressCallback callback) {
+
+        std::string inputPathUtf8 = WideToUtf8Safe(inputPath);
+        zip_t* zip = zip_open(inputPathUtf8.c_str(), ZIP_RDONLY, nullptr);
+
+        if (!zip) {
+            SetError(L"Failed to open bundle file");
+            return false;
+        }
+
+        struct ZipGuard {
+            zip_t* zip;
+            ZipGuard(zip_t* z) : zip(z) {}
+            ~ZipGuard() {
+                if (zip) zip_close(zip);
+            }
+        } zipGuard(zip);
+
+        if (!fs::exists(outputPath)) {
+            try {
+                fs::create_directories(outputPath);
+            }
+            catch (const std::exception& e) {
+                SetError(L"Failed to create output directory: " + Utf8ToWideSafe(e.what()));
+                return false;
+            }
+        }
+
+        zip_int64_t numEntries = zip_get_num_entries(zip, 0);
+        if (numEntries < 0) {
+            SetError(L"Failed to get bundle contents");
+            return false;
+        }
+
+        ProgressInfo progress = {};
+        progress.totalFiles = static_cast<uint64_t>(numEntries);
+        progress.totalBytes = 0;
+
+        for (zip_int64_t i = 0; i < numEntries; ++i) {
+            const char* name = zip_get_name(zip, i, 0);
+            if (!name) continue;
+
+            std::string fileName(name);
+            std::wstring fileNameW = Utf8ToWideSafe(fileName);
+            std::wstring fullPath = outputPath + L"\\" + fileNameW;
+
+            if (callback) {
+                progress.processedFiles = static_cast<uint64_t>(i);
+                progress.currentFile = fileNameW;
+                callback(progress);
+            }
+
+            if (fs::exists(fullPath)) {
+                if (overwrite == OverwriteMode::No) continue;
+                if (overwrite == OverwriteMode::Ask) {
+                    if (!PromptUserOverwrite(fileNameW)) {
+                        continue;
+                    }
+                }
+            }
+
+            zip_file_t* zipFile = zip_fopen_index(zip, i, 0);
+            if (!zipFile) continue;
+
+            std::ofstream outFile(fullPath, std::ios::binary);
+            if (!outFile.is_open()) {
+                zip_fclose(zipFile);
+                continue;
+            }
+
+            char buffer[8192];
+            zip_int64_t bytesRead;
+            while ((bytesRead = zip_fread(zipFile, buffer, sizeof(buffer))) > 0) {
+                outFile.write(buffer, bytesRead);
+                progress.processedBytes += static_cast<uint64_t>(bytesRead);
+            }
+
+            outFile.close();
+            zip_fclose(zipFile);
+        }
+
+        if (callback) {
+            progress.processedFiles = static_cast<uint64_t>(numEntries);
+            progress.currentFile = L"Complete";
+            callback(progress);
+        }
+
+        return true;
+    }
+
+    void AppxBuilderImpl::SetError(const std::wstring& error) {
+        m_lastError = error;
     }
 
     bool AppxBuilderImpl::Build(const BuildOptions& options, ProgressCallback callback) {
@@ -220,7 +992,7 @@ namespace MakeAppxCore {
             catch (...) {
             }
 
-            SetError(L"Build failed: " + Utf8ToWideString(e.what()));
+            SetError(L"Build failed: " + Utf8ToWideSafe(e.what()));
             return false;
         }
     }
@@ -305,7 +1077,7 @@ namespace MakeAppxCore {
             return true;
         }
         catch (const std::exception& e) {
-            SetError(L"CGM conversion failed: " + Utf8ToWideString(e.what()));
+            SetError(L"CGM conversion failed: " + Utf8ToWideSafe(e.what()));
             return false;
         }
     }
@@ -451,651 +1223,5 @@ namespace MakeAppxCore {
         if (endPos == std::wstring::npos) return L"";
 
         return xmlElement.substr(pos, endPos - pos);
-    }
-
-    bool AppxPackageImpl::ProcessFileTree(const std::wstring& rootPath,
-        std::vector<PackageFile>& files) {
-        try {
-            for (const auto& entry : fs::recursive_directory_iterator(rootPath)) {
-                if (entry.is_regular_file()) {
-                    PackageFile pf;
-                    pf.localPath = entry.path().wstring();
-                    pf.packagePath = fs::relative(entry.path(), rootPath).wstring();
-                    pf.size = entry.file_size();
-                    pf.attributes = static_cast<uint32_t>(entry.status().permissions());
-                    files.push_back(pf);
-                }
-            }
-            return true;
-        }
-        catch (const std::exception& e) {
-            std::wstring error = L"Error processing file tree: ";
-            error += Utf8ToWide(e.what());
-            SetError(error);
-            return false;
-        }
-    }
-
-    bool AppxPackageImpl::Pack(const std::wstring& inputPath, const std::wstring& outputPath,
-        CompressionLevel compression, ProgressCallback callback) {
-
-        if (!fs::exists(inputPath) || !fs::is_directory(inputPath)) {
-            SetError(L"Input path does not exist or is not a directory");
-            return false;
-        }
-
-        std::wstring manifestPath = inputPath + L"\\AppxManifest.xml";
-        if (!ValidateManifest(manifestPath)) {
-            return false;
-        }
-
-        fs::path outputDir = fs::path(outputPath).parent_path();
-        if (!outputDir.empty() && !fs::exists(outputDir)) {
-            fs::create_directories(outputDir);
-        }
-
-        std::vector<PackageFile> files;
-        if (!ProcessFileTree(inputPath, files)) {
-            return false;
-        }
-
-        int compressionMethod = ZIP_CM_DEFAULT;
-        switch (compression) {
-        case CompressionLevel::None: compressionMethod = ZIP_CM_STORE; break;
-        case CompressionLevel::Fast: compressionMethod = ZIP_CM_DEFLATE; break;
-        case CompressionLevel::Normal: compressionMethod = ZIP_CM_DEFLATE; break;
-        case CompressionLevel::Maximum: compressionMethod = ZIP_CM_DEFLATE; break;
-        }
-
-        std::string outputPathUtf8 = std::string(outputPath.begin(), outputPath.end());
-        ZipPtr zip(zip_open(outputPathUtf8.c_str(), ZIP_CREATE | ZIP_TRUNCATE, nullptr));
-
-        if (!zip) {
-            SetError(L"Failed to create output package");
-            return false;
-        }
-
-        ProgressInfo progress = {};
-        progress.totalFiles = files.size();
-        progress.totalBytes = 0;
-
-        for (const auto& file : files) {
-            progress.totalBytes += file.size;
-        }
-
-        uint64_t processedBytes = 0;
-        for (size_t i = 0; i < files.size(); ++i) {
-            const auto& file = files[i];
-
-            if (callback) {
-                progress.processedFiles = i;
-                progress.processedBytes = processedBytes;
-                progress.currentFile = file.packagePath;
-                callback(progress);
-            }
-
-            std::string packagePathUtf8(file.packagePath.begin(), file.packagePath.end());
-            std::string localPathUtf8(file.localPath.begin(), file.localPath.end());
-
-            zip_source_t* source = zip_source_file(zip.get(), localPathUtf8.c_str(), 0, -1);
-            if (!source) {
-                SetError(L"Failed to create source for file: " + file.packagePath);
-                return false;
-            }
-
-            zip_int64_t index = zip_file_add(zip.get(), packagePathUtf8.c_str(), source, ZIP_FL_OVERWRITE);
-            if (index < 0) {
-                zip_source_free(source);
-                SetError(L"Failed to add file to package: " + file.packagePath);
-                return false;
-            }
-
-            zip_set_file_compression(zip.get(), index, compressionMethod, 0);
-
-            processedBytes += file.size;
-        }
-
-        if (callback) {
-            progress.processedFiles = files.size();
-            progress.processedBytes = processedBytes;
-            progress.currentFile = L"Finalizing...";
-            callback(progress);
-        }
-
-        return true;
-    }
-
-    bool AppxPackageImpl::Unpack(const std::wstring& inputPath, const std::wstring& outputPath,
-        OverwriteMode overwrite, ProgressCallback callback) {
-
-        std::string inputPathUtf8(inputPath.begin(), inputPath.end());
-        ZipPtr zip(zip_open(inputPathUtf8.c_str(), ZIP_RDONLY, nullptr));
-
-        if (!zip) {
-            SetError(L"Failed to open package file");
-            return false;
-        }
-
-        if (!fs::exists(outputPath)) {
-            fs::create_directories(outputPath);
-        }
-
-        zip_int64_t numEntries = zip_get_num_entries(zip.get(), 0);
-        if (numEntries < 0) {
-            SetError(L"Failed to get package contents");
-            return false;
-        }
-
-        ProgressInfo progress = {};
-        progress.totalFiles = static_cast<uint64_t>(numEntries);
-        progress.totalBytes = 0;
-
-        for (zip_int64_t i = 0; i < numEntries; ++i) {
-            const char* name = zip_get_name(zip.get(), i, 0);
-            if (!name) continue;
-
-            std::wstring fileName = Utf8ToWide(name);
-            std::wstring fullPath = outputPath + L"\\" + fileName;
-
-            if (callback) {
-                progress.processedFiles = static_cast<uint64_t>(i);
-                progress.currentFile = fileName;
-                callback(progress);
-            }
-
-            if (fs::exists(fullPath)) {
-                if (overwrite == OverwriteMode::No) continue;
-                if (overwrite == OverwriteMode::Ask) {
-                    if (!PromptUserOverwrite(fileName)) {
-                        continue;
-                    }
-                }
-            }
-
-            fs::path filePath(fullPath);
-            if (filePath.has_parent_path()) {
-                fs::create_directories(filePath.parent_path());
-            }
-
-            zip_file_t* zipFile = zip_fopen_index(zip.get(), i, 0);
-            if (!zipFile) continue;
-
-            std::ofstream outFile(fullPath, std::ios::binary);
-            if (!outFile.is_open()) {
-                zip_fclose(zipFile);
-                continue;
-            }
-
-            char buffer[BUFFER_SIZE];
-            zip_int64_t bytesRead;
-            while ((bytesRead = zip_fread(zipFile, buffer, BUFFER_SIZE)) > 0) {
-                outFile.write(buffer, bytesRead);
-                progress.processedBytes += static_cast<uint64_t>(bytesRead);
-            }
-
-            outFile.close();
-            zip_fclose(zipFile);
-        }
-
-        if (callback) {
-            progress.processedFiles = static_cast<uint64_t>(numEntries);
-            progress.currentFile = L"Complete";
-            callback(progress);
-        }
-
-        return true;
-    }
-
-    bool AppxPackageImpl::Encrypt(const std::wstring& inputPath, const std::wstring& outputPath,
-        const std::wstring& keyFile) {
-
-        if (!fs::exists(inputPath)) {
-            SetError(L"Input package file does not exist");
-            return false;
-        }
-
-        if (!fs::exists(keyFile)) {
-            SetError(L"Key file does not exist");
-            return false;
-        }
-
-        try {
-            std::ifstream keyFileStream(keyFile, std::ios::binary);
-            if (!keyFileStream.is_open()) {
-                SetError(L"Cannot open key file");
-                return false;
-            }
-
-            std::vector<uint8_t> keyData((std::istreambuf_iterator<char>(keyFileStream)),
-                std::istreambuf_iterator<char>());
-            keyFileStream.close();
-
-            if (keyData.size() != 32) {
-                SetError(L"Invalid key file - must be exactly 32 bytes for AES-256");
-                return false;
-            }
-
-            BCRYPT_ALG_HANDLE hAlgorithm = nullptr;
-            BCRYPT_KEY_HANDLE hKey = nullptr;
-            NTSTATUS status;
-
-            status = BCryptOpenAlgorithmProvider(&hAlgorithm, BCRYPT_AES_ALGORITHM, nullptr, 0);
-            if (!BCRYPT_SUCCESS(status)) {
-                SetError(L"Failed to open AES algorithm provider");
-                return false;
-            }
-
-            status = BCryptSetProperty(hAlgorithm, BCRYPT_CHAINING_MODE,
-                (PUCHAR)BCRYPT_CHAIN_MODE_CBC,
-                sizeof(BCRYPT_CHAIN_MODE_CBC), 0);
-            if (!BCRYPT_SUCCESS(status)) {
-                BCryptCloseAlgorithmProvider(hAlgorithm, 0);
-                SetError(L"Failed to set chaining mode");
-                return false;
-            }
-            status = BCryptGenerateSymmetricKey(hAlgorithm, &hKey, nullptr, 0,
-                keyData.data(), 32, 0);
-            if (!BCRYPT_SUCCESS(status)) {
-                BCryptCloseAlgorithmProvider(hAlgorithm, 0);
-                SetError(L"Failed to generate symmetric key");
-                return false;
-            }
-            uint8_t iv[16];
-            std::random_device rd;
-            std::mt19937 gen(rd());
-            std::uniform_int_distribution<int> dis(0, 255);
-            for (int i = 0; i < 16; ++i) {
-                iv[i] = static_cast<uint8_t>(dis(gen));
-            }
-
-            std::ifstream inputFile(inputPath, std::ios::binary);
-            std::ofstream outputFile(outputPath, std::ios::binary);
-
-            if (!inputFile.is_open() || !outputFile.is_open()) {
-                BCryptDestroyKey(hKey);
-                BCryptCloseAlgorithmProvider(hAlgorithm, 0);
-                SetError(L"Failed to open input or output file");
-                return false;
-            }
-
-            outputFile.write(reinterpret_cast<char*>(iv), 16);
-
-            const size_t CHUNK_SIZE = 8192;
-            uint8_t inputBuffer[CHUNK_SIZE];
-            uint8_t outputBuffer[CHUNK_SIZE + 16];
-            ULONG bytesEncrypted;
-
-            while (inputFile.read(reinterpret_cast<char*>(inputBuffer), CHUNK_SIZE)) {
-                std::streamsize bytesRead = inputFile.gcount();
-
-                if (bytesRead < CHUNK_SIZE) {
-                    size_t padSize = 16 - (bytesRead % 16);
-                    if (padSize == 16 && bytesRead % 16 == 0) padSize = 0;
-                    for (size_t i = 0; i < padSize; ++i) {
-                        inputBuffer[bytesRead + i] = static_cast<uint8_t>(padSize);
-                    }
-                    bytesRead += padSize;
-                }
-
-                status = BCryptEncrypt(hKey, inputBuffer, static_cast<ULONG>(bytesRead),
-                    nullptr, iv, 16, outputBuffer, sizeof(outputBuffer),
-                    &bytesEncrypted, 0);
-
-                if (!BCRYPT_SUCCESS(status)) {
-                    BCryptDestroyKey(hKey);
-                    BCryptCloseAlgorithmProvider(hAlgorithm, 0);
-                    SetError(L"Encryption failed");
-                    return false;
-                }
-
-                outputFile.write(reinterpret_cast<char*>(outputBuffer), bytesEncrypted);
-
-                memcpy(iv, outputBuffer + bytesEncrypted - 16, 16);
-            }
-
-            inputFile.close();
-            outputFile.close();
-            BCryptDestroyKey(hKey);
-            BCryptCloseAlgorithmProvider(hAlgorithm, 0);
-
-            return true;
-        }
-        catch (const std::exception& e) {
-            SetError(L"Encryption failed: " + Utf8ToWide(e.what()));
-            return false;
-        }
-    }
-
-    bool AppxPackageImpl::Decrypt(const std::wstring& inputPath, const std::wstring& outputPath,
-        const std::wstring& keyFile) {
-
-        if (!fs::exists(inputPath)) {
-            SetError(L"Input encrypted file does not exist");
-            return false;
-        }
-
-        if (!fs::exists(keyFile)) {
-            SetError(L"Key file does not exist");
-            return false;
-        }
-
-        try {
-            std::ifstream keyFileStream(keyFile, std::ios::binary);
-            if (!keyFileStream.is_open()) {
-                SetError(L"Cannot open key file");
-                return false;
-            }
-
-            std::vector<uint8_t> keyData((std::istreambuf_iterator<char>(keyFileStream)),
-                std::istreambuf_iterator<char>());
-            keyFileStream.close();
-
-            if (keyData.size() != 32) {
-                SetError(L"Invalid key file - must be exactly 32 bytes for AES-256");
-                return false;
-            }
-
-            BCRYPT_ALG_HANDLE hAlgorithm = nullptr;
-            BCRYPT_KEY_HANDLE hKey = nullptr;
-            NTSTATUS status;
-
-            status = BCryptOpenAlgorithmProvider(&hAlgorithm, BCRYPT_AES_ALGORITHM, nullptr, 0);
-            if (!BCRYPT_SUCCESS(status)) {
-                SetError(L"Failed to open AES algorithm provider");
-                return false;
-            }
-
-            status = BCryptSetProperty(hAlgorithm, BCRYPT_CHAINING_MODE,
-                (PUCHAR)BCRYPT_CHAIN_MODE_CBC,
-                sizeof(BCRYPT_CHAIN_MODE_CBC), 0);
-            if (!BCRYPT_SUCCESS(status)) {
-                BCryptCloseAlgorithmProvider(hAlgorithm, 0);
-                SetError(L"Failed to set chaining mode");
-                return false;
-            }
-
-            status = BCryptGenerateSymmetricKey(hAlgorithm, &hKey, nullptr, 0,
-                keyData.data(), 32, 0);
-            if (!BCRYPT_SUCCESS(status)) {
-                BCryptCloseAlgorithmProvider(hAlgorithm, 0);
-                SetError(L"Failed to generate symmetric key");
-                return false;
-            }
-
-            std::ifstream inputFile(inputPath, std::ios::binary);
-            std::ofstream outputFile(outputPath, std::ios::binary);
-
-            if (!inputFile.is_open() || !outputFile.is_open()) {
-                BCryptDestroyKey(hKey);
-                BCryptCloseAlgorithmProvider(hAlgorithm, 0);
-                SetError(L"Failed to open input or output file");
-                return false;
-            }
-
-            uint8_t iv[16];
-            inputFile.read(reinterpret_cast<char*>(iv), 16);
-            if (inputFile.gcount() != 16) {
-                BCryptDestroyKey(hKey);
-                BCryptCloseAlgorithmProvider(hAlgorithm, 0);
-                SetError(L"Invalid encrypted file - missing IV");
-                return false;
-            }
-
-            const size_t CHUNK_SIZE = 8192;
-            uint8_t inputBuffer[CHUNK_SIZE];
-            uint8_t outputBuffer[CHUNK_SIZE];
-            ULONG bytesDecrypted;
-            bool isLastChunk = false;
-
-            while (inputFile.read(reinterpret_cast<char*>(inputBuffer), CHUNK_SIZE)) {
-                std::streamsize bytesRead = inputFile.gcount();
-
-                if (bytesRead < CHUNK_SIZE) {
-                    isLastChunk = true;
-                }
-
-                status = BCryptDecrypt(hKey, inputBuffer, static_cast<ULONG>(bytesRead),
-                    nullptr, iv, 16, outputBuffer, sizeof(outputBuffer),
-                    &bytesDecrypted, 0);
-
-                if (!BCRYPT_SUCCESS(status)) {
-                    BCryptDestroyKey(hKey);
-                    BCryptCloseAlgorithmProvider(hAlgorithm, 0);
-                    SetError(L"Decryption failed");
-                    return false;
-                }
-
-                if (isLastChunk && bytesDecrypted > 0) {
-                    uint8_t padSize = outputBuffer[bytesDecrypted - 1];
-                    if (padSize <= 16 && padSize <= bytesDecrypted) {
-                        bytesDecrypted -= padSize;
-                    }
-                }
-
-                if (bytesDecrypted > 0) {
-                    outputFile.write(reinterpret_cast<char*>(outputBuffer), bytesDecrypted);
-                }
-
-                memcpy(iv, inputBuffer + bytesRead - 16, 16);
-            }
-
-            inputFile.close();
-            outputFile.close();
-            BCryptDestroyKey(hKey);
-            BCryptCloseAlgorithmProvider(hAlgorithm, 0);
-
-            return true;
-        }
-        catch (const std::exception& e) {
-            SetError(L"Decryption failed: " + Utf8ToWide(e.what()));
-            return false;
-        }
-    }
-
-    void AppxBundleImpl::SetError(const std::wstring& error) {
-        m_lastError = error;
-    }
-
-    bool AppxBundleImpl::Bundle(const std::wstring& inputPath, const std::wstring& outputPath,
-        CompressionLevel compression, ProgressCallback callback) {
-
-        if (!fs::exists(inputPath) || !fs::is_directory(inputPath)) {
-            SetError(L"Input path does not exist or is not a directory");
-            return false;
-        }
-
-        std::vector<fs::path> packageFiles;
-        try {
-            for (const auto& entry : fs::directory_iterator(inputPath)) {
-                if (entry.is_regular_file()) {
-                    auto ext = entry.path().extension().wstring();
-                    std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
-                    if (ext == L".appx" || ext == L".msix") {
-                        packageFiles.push_back(entry.path());
-                    }
-                }
-            }
-        }
-        catch (const std::exception& e) {
-            SetError(L"Error scanning input directory");
-            return false;
-        }
-
-        if (packageFiles.empty()) {
-            SetError(L"No .appx or .msix files found in input directory");
-            return false;
-        }
-
-        std::wstring bundleManifest = GenerateBundleManifest(packageFiles);
-        if (bundleManifest.empty()) {
-            return false;
-        }
-
-        fs::path outputDir = fs::path(outputPath).parent_path();
-        if (!outputDir.empty() && !fs::exists(outputDir)) {
-            fs::create_directories(outputDir);
-        }
-
-        int compressionMethod = (compression == CompressionLevel::None) ? ZIP_CM_STORE : ZIP_CM_DEFLATE;
-        std::string outputPathUtf8(outputPath.begin(), outputPath.end());
-
-        zip_t* zip = zip_open(outputPathUtf8.c_str(), ZIP_CREATE | ZIP_TRUNCATE, nullptr);
-        if (!zip) {
-            SetError(L"Failed to create bundle file");
-            return false;
-        }
-
-        ProgressInfo progress = {};
-        progress.totalFiles = packageFiles.size() + 1;
-        progress.totalBytes = 0;
-
-        for (const auto& file : packageFiles) {
-            try {
-                progress.totalBytes += fs::file_size(file);
-            }
-            catch (...) {
-                continue;
-            }
-        }
-
-        zip_source_t* manifestSource = zip_source_buffer(zip,
-            bundleManifest.c_str(), bundleManifest.length() * sizeof(wchar_t), 0);
-        if (!manifestSource || zip_file_add(zip, "AppxBundleManifest.xml", manifestSource, ZIP_FL_OVERWRITE) < 0) {
-            zip_close(zip);
-            SetError(L"Failed to add bundle manifest");
-            return false;
-        }
-
-        uint64_t processedBytes = 0;
-        for (size_t i = 0; i < packageFiles.size(); ++i) {
-            const auto& packageFile = packageFiles[i];
-
-            if (callback) {
-                progress.processedFiles = i + 1;
-                progress.processedBytes = processedBytes;
-                progress.currentFile = packageFile.filename().wstring();
-                callback(progress);
-            }
-
-            std::string localPathUtf8 = packageFile.string();
-            std::string packageName = packageFile.filename().string();
-
-            zip_source_t* source = zip_source_file(zip, localPathUtf8.c_str(), 0, -1);
-            if (!source) {
-                zip_close(zip);
-                SetError(L"Failed to create source for: " + packageFile.wstring());
-                return false;
-            }
-
-            zip_int64_t index = zip_file_add(zip, packageName.c_str(), source, ZIP_FL_OVERWRITE);
-            if (index < 0) {
-                zip_source_free(source);
-                zip_close(zip);
-                SetError(L"Failed to add package to bundle: " + packageFile.wstring());
-                return false;
-            }
-
-            zip_set_file_compression(zip, index, compressionMethod, 0);
-
-            try {
-                processedBytes += fs::file_size(packageFile);
-            }
-            catch (...) {
-            }
-        }
-
-        if (callback) {
-            progress.processedFiles = packageFiles.size() + 1;
-            progress.processedBytes = processedBytes;
-            progress.currentFile = L"Finalizing bundle...";
-            callback(progress);
-        }
-
-        int result = zip_close(zip);
-        if (result != 0) {
-            SetError(L"Failed to finalize bundle");
-            return false;
-        }
-
-        return true;
-    }
-
-    bool AppxBundleImpl::Unbundle(const std::wstring& inputPath, const std::wstring& outputPath,
-        OverwriteMode overwrite, ProgressCallback callback) {
-
-        std::string inputPathUtf8(inputPath.begin(), inputPath.end());
-        zip_t* zip = zip_open(inputPathUtf8.c_str(), ZIP_RDONLY, nullptr);
-
-        if (!zip) {
-            SetError(L"Failed to open bundle file");
-            return false;
-        }
-
-        if (!fs::exists(outputPath)) {
-            fs::create_directories(outputPath);
-        }
-
-        zip_int64_t numEntries = zip_get_num_entries(zip, 0);
-        if (numEntries < 0) {
-            zip_close(zip);
-            SetError(L"Failed to get bundle contents");
-            return false;
-        }
-
-        ProgressInfo progress = {};
-        progress.totalFiles = static_cast<uint64_t>(numEntries);
-        progress.totalBytes = 0;
-        for (zip_int64_t i = 0; i < numEntries; ++i) {
-            const char* name = zip_get_name(zip, i, 0);
-            if (!name) continue;
-
-            std::string fileName(name);
-            std::wstring fileNameW(fileName.begin(), fileName.end());
-            std::wstring fullPath = outputPath + L"\\" + fileNameW;
-
-            if (callback) {
-                progress.processedFiles = static_cast<uint64_t>(i);
-                progress.currentFile = fileNameW;
-                callback(progress);
-            }
-
-            if (fs::exists(fullPath)) {
-                if (overwrite == OverwriteMode::No) continue;
-                if (overwrite == OverwriteMode::Ask) {
-                    if (!PromptUserOverwrite(fileNameW)) {
-                        continue;
-                    }
-                }
-            }
-
-            zip_file_t* zipFile = zip_fopen_index(zip, i, 0);
-            if (!zipFile) continue;
-
-            std::ofstream outFile(fullPath, std::ios::binary);
-            if (!outFile.is_open()) {
-                zip_fclose(zipFile);
-                continue;
-            }
-
-            char buffer[8192];
-            zip_int64_t bytesRead;
-            while ((bytesRead = zip_fread(zipFile, buffer, sizeof(buffer))) > 0) {
-                outFile.write(buffer, bytesRead);
-                progress.processedBytes += static_cast<uint64_t>(bytesRead);
-            }
-
-            outFile.close();
-            zip_fclose(zipFile);
-        }
-
-        zip_close(zip);
-
-        if (callback) {
-            progress.processedFiles = static_cast<uint64_t>(numEntries);
-            progress.currentFile = L"Complete";
-            callback(progress);
-        }
-
-        return true;
     }
 }

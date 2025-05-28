@@ -9,22 +9,17 @@ namespace MakeAppxCore {
 
     namespace fs = std::filesystem;
 
+    std::string WideToUtf8Safe(const std::wstring& wstr);
+    std::wstring Utf8ToWideSafe(const std::string& str);
+
     class AppxPackageImpl : public IAppxPackage {
     private:
         std::wstring m_lastError;
         static constexpr size_t BUFFER_SIZE = 8192;
 
-        struct ZipDeleter {
-            void operator()(zip_t* zip) {
-                if (zip) zip_close(zip);
-            }
-        };
-        using ZipPtr = std::unique_ptr<zip_t, ZipDeleter>;
-
         bool ValidateManifest(const std::wstring& manifestPath);
         bool ProcessFileTree(const std::wstring& rootPath,
             std::vector<PackageFile>& files);
-        bool WriteManifestFiles(ZipPtr& zip, const std::wstring& inputPath);
         void SetError(const std::wstring& error);
         std::wstring WideToUtf8(const std::wstring& wide);
         std::wstring Utf8ToWide(const std::string& utf8);
