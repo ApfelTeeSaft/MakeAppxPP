@@ -4,6 +4,7 @@
 #include <memory>
 #include <functional>
 #include <unordered_map>
+#include <filesystem>
 
 namespace MakeAppxCore {
 
@@ -19,23 +20,6 @@ namespace MakeAppxCore {
         Yes,
         No
     };
-
-    struct BuildOptions {
-        std::wstring layoutFile;
-        std::wstring outputPath;
-        CompressionLevel compression = CompressionLevel::Normal;
-        bool verbose = false;
-    };
-
-    class IAppxBuilder {
-    public:
-        virtual ~IAppxBuilder() = default;
-        virtual bool Build(const BuildOptions& options, ProgressCallback callback = nullptr) = 0;
-        virtual bool ConvertCGM(const std::wstring& sourceCGM, const std::wstring& outputCGM) = 0;
-        virtual std::wstring GetLastError() const = 0;
-    };
-
-    std::unique_ptr<IAppxBuilder> CreateAppxBuilder();
 
     struct PackageFile {
         std::wstring localPath;
@@ -53,6 +37,23 @@ namespace MakeAppxCore {
     };
 
     using ProgressCallback = std::function<void(const ProgressInfo&)>;
+
+    struct BuildOptions {
+        std::wstring layoutFile;
+        std::wstring outputPath;
+        CompressionLevel compression = CompressionLevel::Normal;
+        bool verbose = false;
+    };
+
+    class IAppxBuilder {
+    public:
+        virtual ~IAppxBuilder() = default;
+        virtual bool Build(const BuildOptions& options, ProgressCallback callback = nullptr) = 0;
+        virtual bool ConvertCGM(const std::wstring& sourceCGM, const std::wstring& outputCGM) = 0;
+        virtual std::wstring GetLastError() const = 0;
+    };
+
+    std::unique_ptr<IAppxBuilder> CreateAppxBuilder();
 
     class IAppxPackage {
     public:

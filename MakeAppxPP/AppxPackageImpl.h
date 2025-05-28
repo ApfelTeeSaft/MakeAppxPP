@@ -2,8 +2,12 @@
 #include "AppxPackage.h"
 #include <zip.h>
 #include <memory>
+#include <filesystem>
+#include <vector>
 
 namespace MakeAppxCore {
+
+    namespace fs = std::filesystem;
 
     class AppxPackageImpl : public IAppxPackage {
     private:

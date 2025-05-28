@@ -1,10 +1,9 @@
+#define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING
 #include "AppxPackageImpl.h"
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
-#include <codecvt>
-#include <locale>
 #include <algorithm>
 #include <Windows.h>
 #include <bcrypt.h>
@@ -30,21 +29,42 @@ namespace MakeAppxCore {
         return std::make_unique<AppxBuilderImpl>();
     }
 
+    std::wstring WideStringToString(const std::wstring& wstr) {
+        if (wstr.empty()) return std::wstring();
+
+        int size = WideCharToMultiByte(CP_UTF8, 0, &wstr[0], static_cast<int>(wstr.size()),
+            nullptr, 0, nullptr, nullptr);
+        if (size == 0) return std::wstring();
+
+        std::string result(size, 0);
+        WideCharToMultiByte(CP_UTF8, 0, &wstr[0], static_cast<int>(wstr.size()),
+            &result[0], size, nullptr, nullptr);
+        return std::wstring(result.begin(), result.end());
+    }
+
+    std::wstring StringToWideString(const std::string& str) {
+        if (str.empty()) return std::wstring();
+
+        int size = MultiByteToWideChar(CP_UTF8, 0, &str[0], static_cast<int>(str.size()),
+            nullptr, 0);
+        if (size == 0) return std::wstring();
+
+        std::wstring result(size, 0);
+        MultiByteToWideChar(CP_UTF8, 0, &str[0], static_cast<int>(str.size()),
+            &result[0], size);
+        return result;
+    }
+
     void AppxPackageImpl::SetError(const std::wstring& error) {
         m_lastError = error;
     }
 
     std::wstring AppxPackageImpl::WideToUtf8(const std::wstring& wide) {
-        if (wide.empty()) return std::wstring();
-        std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
-        std::string narrow = converter.to_bytes(wide);
-        return std::wstring(narrow.begin(), narrow.end());
+        return WideStringToString(wide);
     }
 
     std::wstring AppxPackageImpl::Utf8ToWide(const std::string& utf8) {
-        if (utf8.empty()) return std::wstring();
-        std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
-        return converter.from_bytes(utf8);
+        return StringToWideString(utf8);
     }
 
     bool AppxPackageImpl::PromptUserOverwrite(const std::wstring& filePath) {
@@ -155,9 +175,7 @@ namespace MakeAppxCore {
     }
 
     std::wstring Utf8ToWideString(const std::string& utf8) {
-        if (utf8.empty()) return std::wstring();
-        std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
-        return converter.from_bytes(utf8);
+        return StringToWideString(utf8);
     }
 
     bool AppxBuilderImpl::Build(const BuildOptions& options, ProgressCallback callback) {
@@ -685,9 +703,9 @@ namespace MakeAppxCore {
             uint8_t iv[16];
             std::random_device rd;
             std::mt19937 gen(rd());
-            std::uniform_int_distribution<uint8_t> dis(0, 255);
+            std::uniform_int_distribution<int> dis(0, 255);
             for (int i = 0; i < 16; ++i) {
-                iv[i] = dis(gen);
+                iv[i] = static_cast<uint8_t>(dis(gen));
             }
 
             std::ifstream inputFile(inputPath, std::ios::binary);
