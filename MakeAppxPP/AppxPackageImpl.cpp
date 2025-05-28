@@ -11,6 +11,7 @@
 #include <random>
 #include <codecvt>
 #include <locale>
+#include <chrono>
 
 #pragma comment(lib, "bcrypt.lib")
 
@@ -150,25 +151,16 @@ namespace MakeAppxCore {
     bool AppxPackageImpl::Pack(const std::wstring& inputPath, const std::wstring& outputPath,
         CompressionLevel compression, ProgressCallback callback) {
 
-        std::wcout << L"[DEBUG] Pack method called" << std::endl;
-        std::wcout << L"[DEBUG] Input: " << inputPath << std::endl;
-        std::wcout << L"[DEBUG] Output: " << outputPath << std::endl;
-
         if (!fs::exists(inputPath) || !fs::is_directory(inputPath)) {
             SetError(L"Input path does not exist or is not a directory");
-            std::wcerr << L"[ERROR] " << GetLastError() << std::endl;
             return false;
         }
 
         std::wstring manifestPath = inputPath + L"\\AppxManifest.xml";
-        std::wcout << L"[DEBUG] Checking manifest: " << manifestPath << std::endl;
-
         if (!ValidateManifest(manifestPath)) {
-            std::wcerr << L"[ERROR] Manifest validation failed: " << GetLastError() << std::endl;
             return false;
         }
 
-        std::wcout << L"[DEBUG] Creating output directory if needed" << std::endl;
         fs::path outputDir = fs::path(outputPath).parent_path();
         if (!outputDir.empty() && !fs::exists(outputDir)) {
             try {
@@ -180,18 +172,26 @@ namespace MakeAppxCore {
             }
         }
 
-        std::wcout << L"[DEBUG] Processing file tree" << std::endl;
         std::vector<PackageFile> files;
         if (!ProcessFileTree(inputPath, files)) {
-            std::wcerr << L"[ERROR] Failed to process file tree: " << GetLastError() << std::endl;
             return false;
         }
-
-        std::wcout << L"[DEBUG] Found " << files.size() << L" files to pack" << std::endl;
 
         if (files.empty()) {
             SetError(L"No files found to package");
             return false;
+        }
+
+        uint64_t totalSize = 0;
+        for (const auto& file : files) {
+            totalSize += file.size;
+        }
+
+        bool isLargePackage = totalSize > (10ULL * 1024 * 1024 * 1024);
+        if (isLargePackage && compression != CompressionLevel::None) {
+            std::wcout << L"Warning: Large package detected (" << (totalSize / (1024 * 1024 * 1024))
+                << L" GB). Using no compression to avoid hanging." << std::endl;
+            compression = CompressionLevel::None;
         }
 
         std::string outputPathUtf8 = WideToUtf8Safe(outputPath);
@@ -200,8 +200,6 @@ namespace MakeAppxCore {
             return false;
         }
 
-        std::wcout << L"[DEBUG] Opening ZIP file for writing: " << outputPath << std::endl;
-
         int error = 0;
         zip_t* zip = zip_open(outputPathUtf8.c_str(), ZIP_CREATE | ZIP_TRUNCATE, &error);
 
@@ -209,26 +207,10 @@ namespace MakeAppxCore {
             std::wstringstream ss;
             ss << L"Failed to create output package. ZIP error code: " << error;
             SetError(ss.str());
-            std::wcerr << L"[ERROR] " << GetLastError() << std::endl;
             return false;
         }
 
-        struct ZipGuard {
-            zip_t* zip;
-            ZipGuard(zip_t* z) : zip(z) {}
-            ~ZipGuard() {
-                if (zip) {
-                    int result = zip_close(zip);
-                    if (result != 0) {
-                        std::wcerr << L"[WARNING] Failed to close ZIP file properly" << std::endl;
-                    }
-                }
-            }
-        } zipGuard(zip);
-
-        std::wcout << L"[DEBUG] ZIP file opened successfully" << std::endl;
-
-        int compressionMethod = ZIP_CM_DEFAULT;
+        int compressionMethod = ZIP_CM_STORE;
         switch (compression) {
         case CompressionLevel::None:
             compressionMethod = ZIP_CM_STORE;
@@ -236,20 +218,20 @@ namespace MakeAppxCore {
         case CompressionLevel::Fast:
         case CompressionLevel::Normal:
         case CompressionLevel::Maximum:
-            compressionMethod = ZIP_CM_DEFLATE;
+            if (!isLargePackage) {
+                compressionMethod = ZIP_CM_DEFLATE;
+            }
             break;
         }
 
         ProgressInfo progress = {};
         progress.totalFiles = files.size();
-        progress.totalBytes = 0;
-
-        for (const auto& file : files) {
-            progress.totalBytes += file.size;
-        }
+        progress.totalBytes = totalSize;
 
         uint64_t processedBytes = 0;
-        for (size_t i = 0; i < files.size(); ++i) {
+        bool success = true;
+
+        for (size_t i = 0; i < files.size() && success; ++i) {
             const auto& file = files[i];
 
             if (callback) {
@@ -264,10 +246,9 @@ namespace MakeAppxCore {
 
             if (packagePathUtf8.empty() || localPathUtf8.empty()) {
                 SetError(L"Failed to convert file paths to UTF-8: " + file.packagePath);
-                return false;
+                success = false;
+                break;
             }
-
-            std::wcout << L"[DEBUG] Adding file: " << file.packagePath << std::endl;
 
             zip_source_t* source = zip_source_file(zip, localPathUtf8.c_str(), 0, -1);
             if (!source) {
@@ -277,7 +258,8 @@ namespace MakeAppxCore {
                     error_msg += L" (ZIP error: " + Utf8ToWideSafe(zip_error_strerror(zip_err)) + L")";
                 }
                 SetError(error_msg);
-                return false;
+                success = false;
+                break;
             }
 
             zip_int64_t index = zip_file_add(zip, packagePathUtf8.c_str(), source, ZIP_FL_OVERWRITE);
@@ -288,28 +270,76 @@ namespace MakeAppxCore {
                     error_msg += L" (ZIP error: " + Utf8ToWideSafe(zip_error_strerror(zip_err)) + L")";
                 }
                 SetError(error_msg);
-                return false;
+                success = false;
+                break;
             }
 
-            if (compressionMethod != ZIP_CM_DEFAULT) {
-                if (zip_set_file_compression(zip, index, compressionMethod, 0) != 0) {
-                    std::wcout << L"[WARNING] Failed to set compression for: " << file.packagePath << std::endl;
-                }
+            if (zip_set_file_compression(zip, index, compressionMethod, 0) != 0) {
             }
 
             processedBytes += file.size;
+
+            if (isLargePackage && (i % 50 == 0)) {
+                std::wcout.flush();
+            }
         }
 
-        if (callback) {
+        if (callback && success) {
             progress.processedFiles = files.size();
             progress.processedBytes = processedBytes;
-            progress.currentFile = L"Finalizing...";
+            progress.currentFile = L"";
             callback(progress);
         }
 
-        std::wcout << L"[DEBUG] All files added, finalizing ZIP" << std::endl;
+        if (!success) {
+            zip_discard(zip);
+            return false;
+        }
 
-        std::wcout << L"[DEBUG] Package created successfully" << std::endl;
+        if (isLargePackage) {
+            std::wcout << L"Finalizing large package (" << (totalSize / (1024 * 1024 * 1024))
+                << L" GB) - this may take 10-20 minutes..." << std::endl;
+            std::wcout << L"Writing ZIP central directory, please wait..." << std::endl;
+        }
+        else {
+            std::wcout << L"Finalizing package..." << std::endl;
+        }
+
+        auto start_time = std::chrono::steady_clock::now();
+        int close_result = zip_close(zip);
+        auto end_time = std::chrono::steady_clock::now();
+
+        if (close_result != 0) {
+            SetError(L"Failed to finalize package - ZIP close operation failed");
+            return false;
+        }
+
+        auto duration = std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time);
+        if (isLargePackage) {
+            std::wcout << L"Finalization completed in " << duration.count() << L" seconds." << std::endl;
+        }
+
+        if (!fs::exists(outputPath)) {
+            SetError(L"Output package file was not created");
+            return false;
+        }
+
+        try {
+            auto fileSize = fs::file_size(outputPath);
+            if (fileSize == 0) {
+                SetError(L"Output package file is empty");
+                return false;
+            }
+
+            std::wcout << L"Package created successfully!" << std::endl;
+            std::wcout << L"Final size: " << (fileSize / (1024 * 1024)) << L" MB" << std::endl;
+
+        }
+        catch (const std::exception& e) {
+            SetError(L"Failed to verify output package: " + Utf8ToWideSafe(e.what()));
+            return false;
+        }
+
         return true;
     }
 
