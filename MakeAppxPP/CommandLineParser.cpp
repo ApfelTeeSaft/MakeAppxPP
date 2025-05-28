@@ -702,7 +702,6 @@ namespace MakeAppxPP {
         const int barWidth = 20;
         int filledWidth = (int)(filePercent / 100.0 * barWidth);
 
-        // Build the entire output string first to avoid multiple stream operations
         std::wstringstream ss;
 
         ss << L"\r[";
@@ -729,15 +728,13 @@ namespace MakeAppxPP {
             ss << L" - " << displayFile;
         }
 
-        ss << L"                    "; // Padding to clear previous text
+        ss << L"                    ";
 
-        // Output the entire string at once
         std::wcout << ss.str();
 
         if (currentComplete) {
             std::wcout << std::endl;
 
-            // Show finalization message when we reach 100%
             if (!finalizationMessageShown) {
                 std::wcout << L"Processing with zlib, this might take a while..." << std::endl;
                 finalizationMessageShown = true;
