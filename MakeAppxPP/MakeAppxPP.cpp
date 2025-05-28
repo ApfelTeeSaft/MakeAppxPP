@@ -22,16 +22,30 @@ void SetupConsole() {
             SetConsoleMode(hOut, dwMode);
         }
     }
-
-    _setmode(_fileno(stdout), _O_U16TEXT);
-    _setmode(_fileno(stderr), _O_U16TEXT);
-    _setmode(_fileno(stdin), _O_U16TEXT);
 #endif
 
-    std::locale::global(std::locale(""));
-    std::wcout.imbue(std::locale());
-    std::wcerr.imbue(std::locale());
-    std::wcin.imbue(std::locale());
+    try {
+        std::locale loc("");
+        std::locale::global(loc);
+        std::wcout.imbue(loc);
+        std::wcerr.imbue(loc);
+        std::wcin.imbue(loc);
+    }
+    catch (const std::exception&) {
+        try {
+            std::locale utf8_loc("en_US.UTF-8");
+            std::locale::global(utf8_loc);
+            std::wcout.imbue(utf8_loc);
+            std::wcerr.imbue(utf8_loc);
+            std::wcin.imbue(utf8_loc);
+        }
+        catch (const std::exception&) {
+            std::locale::global(std::locale::classic());
+            std::wcout.imbue(std::locale::classic());
+            std::wcerr.imbue(std::locale::classic());
+            std::wcin.imbue(std::locale::classic());
+        }
+    }
 }
 
 int wmain(int argc, wchar_t* argv[]) {

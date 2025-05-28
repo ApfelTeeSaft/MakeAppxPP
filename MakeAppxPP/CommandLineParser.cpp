@@ -685,7 +685,6 @@ namespace MakeAppxPP {
         static bool isComplete = false;
 
         auto now = std::chrono::steady_clock::now();
-
         bool currentComplete = (progress.processedFiles >= progress.totalFiles);
 
         if (!currentComplete && !isComplete &&
@@ -702,16 +701,19 @@ namespace MakeAppxPP {
         const int barWidth = 20;
         int filledWidth = (int)(filePercent / 100.0 * barWidth);
 
-        std::wcout << L"\r[";
+        std::wstringstream ss;
+
+        ss << L"\r[";
         for (int i = 0; i < barWidth; ++i) {
             if (i < filledWidth) {
-                std::wcout << L"#";
+                ss << L"#";
             }
             else {
-                std::wcout << L"-";
+                ss << L"-";
             }
         }
-        std::wcout << L"] " << std::fixed << std::setprecision(1)
+
+        ss << L"] " << std::fixed << std::setprecision(1)
             << filePercent << L"% (" << progress.processedFiles
             << L"/" << progress.totalFiles << L" files, "
             << FormatFileSize(progress.processedBytes) << L"/"
@@ -722,10 +724,12 @@ namespace MakeAppxPP {
             if (displayFile.length() > 40) {
                 displayFile = L"..." + displayFile.substr(displayFile.length() - 37);
             }
-            std::wcout << L" - " << displayFile;
+            ss << L" - " << displayFile;
         }
 
-        std::wcout << L"                    ";
+        ss << L"                    ";
+
+        std::wcout << ss.str();
 
         if (currentComplete) {
             std::wcout << std::endl;
